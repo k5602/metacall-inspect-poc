@@ -54,9 +54,15 @@ endmacro()
 add_ts_grammar(ts_python tree_sitter_python https://github.com/tree-sitter/tree-sitter-python v0.23.6)
 add_ts_grammar(ts_javascript tree_sitter_javascript https://github.com/tree-sitter/tree-sitter-javascript v0.23.1)
 
-add_executable(ast_inspect src/ast_inspect.cpp)
+add_executable(ast_inspect
+	src/ast_main.cpp
+	src/ast_cli.cpp
+	src/ast_extract.cpp
+	src/ast_serialize.cpp)
 target_link_libraries(ast_inspect PRIVATE ts_runtime ts_python ts_javascript)
-target_include_directories(ast_inspect PRIVATE ${tree_sitter_SOURCE_DIR}/lib/include)
+target_include_directories(ast_inspect PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/include
+	${tree_sitter_SOURCE_DIR}/lib/include)
 
 if(METACALL_INSPECT_POC_BUILD_AST_TESTS)
 	enable_testing()

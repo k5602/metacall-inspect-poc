@@ -1,160 +1,151 @@
 cmake_minimum_required(VERSION 3.16)
-project(metacall_inspect_poc CXX)
+project(metacall_inspect_poc C CXX)
 
-# Standards
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ---------------------------------------------------------------------------
-# Find MetaCall (Use -DMETACALL_ROOT_DIR=/path/to/core/build)
-# ---------------------------------------------------------------------------
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-find_package(MetaCall REQUIRED)
+option(METACALL_INSPECT_POC_BUILD_RUNTIME "Build runtime inspect demo and runtime-linked targets" ON)
+option(METACALL_INSPECT_POC_BUILD_RUNTIME_TESTS "Build runtime inspect gtest target" ON)
+option(METACALL_INSPECT_POC_BUILD_BENCHMARKS "Build benchmark target" ON)
+option(METACALL_INSPECT_POC_BUILD_AST_TESTS "Enable CTest checks for ast_inspect output" ON)
 
-# ---------------------------------------------------------------------------
-# Dependencies (GTest & Benchmark)
-# ---------------------------------------------------------------------------
-include(FetchContent)
-FetchContent_Declare(googletest URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip DOWNLOAD_EXTRACT_TIMESTAMP ON)
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
-
-FetchContent_Declare(googlebenchmark URL https://github.com/google/benchmark/archive/refs/tags/v1.8.3.zip DOWNLOAD_EXTRACT_TIMESTAMP ON)
-set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
-set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googlebenchmark)
-
-# ---------------------------------------------------------------------------
-# Definitions
-# ---------------------------------------------------------------------------
 add_compile_definitions(SCRIPTS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/scripts")
-if(METACALL_ROOT_DIR)
-    add_compile_definitions(METACALL_BUILD_DIR="${METACALL_ROOT_DIR}")
+
+include(FetchContent)
+
+cmake_policy(SET CMP0169 OLD)
+
+FetchContent_Declare(tree_sitter
+	URL https://github.com/tree-sitter/tree-sitter/archive/refs/tags/v0.22.6.zip
+	DOWNLOAD_EXTRACT_TIMESTAMP ON)
+FetchContent_GetProperties(tree_sitter)
+if(NOT tree_sitter_POPULATED)
+	FetchContent_Populate(tree_sitter)
 endif()
 
-# ---------------------------------------------------------------------------
-# ASan auto-detection
-# If the MetaCall build has ASan enabled, this POC must also enable it
-# to avoid "ASan runtime does not come first" errors on Linux "WARN.
-# ---------------------------------------------------------------------------
-set(METACALL_ASAN_DETECTED FALSE)
-set(METACALL_ASAN_COMPILE_FLAGS)
-set(METACALL_ASAN_LINK_FLAGS)
-set(METACALL_ASAN_PRELOAD_ENV)
-set(METACALL_ASAN_RUNTIME_ENV)
+add_library(ts_runtime STATIC ${tree_sitter_SOURCE_DIR}/lib/src/lib.c)
+target_include_directories(ts_runtime
+	PUBLIC ${tree_sitter_SOURCE_DIR}/lib/include
+	PRIVATE ${tree_sitter_SOURCE_DIR}/lib/src)
+set_target_properties(ts_runtime PROPERTIES C_STANDARD 11)
 
-if(METACALL_LIBRARY AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME MATCHES "Darwin") AND (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
-    get_filename_component(_mc_lib_dir "${METACALL_LIBRARY}" DIRECTORY)
-    set(_probe_names py_loader libpy_loader node_loader libnode_loader rb_loader librb_loader mock_loader libmock_loader)
-    set(_probe_lib)
-    foreach(_name ${_probe_names})
-        find_library(_found_probe "${_name}" PATHS "${_mc_lib_dir}" NO_DEFAULT_PATH)
-        if(_found_probe)
-            set(_probe_lib "${_found_probe}")
-            unset(_found_probe CACHE)
-            break()
-        endif()
-        unset(_found_probe CACHE)
-    endforeach()
+macro(add_ts_grammar target_name content_name repo_url repo_tag)
+	FetchContent_Declare(${content_name}
+		URL ${repo_url}/archive/refs/tags/${repo_tag}.zip
+		DOWNLOAD_EXTRACT_TIMESTAMP ON)
+	FetchContent_GetProperties(${content_name})
+	if(NOT ${content_name}_POPULATED)
+		FetchContent_Populate(${content_name})
+	endif()
 
-    if(_probe_lib)
-        file(GET_RUNTIME_DEPENDENCIES LIBRARIES "${_probe_lib}" RESOLVED_DEPENDENCIES_VAR _probe_resolved UNRESOLVED_DEPENDENCIES_VAR _probe_unresolved)
-        set(_libasan_path)
-        set(_libubsan_path)
-        foreach(_dep IN LISTS _probe_resolved)
-            if("${_dep}" MATCHES "libasan")
-                set(_libasan_path "${_dep}")
-            endif()
-            if("${_dep}" MATCHES "libubsan")
-                set(_libubsan_path "${_dep}")
-            endif()
-        endforeach()
+	add_library(${target_name} STATIC
+		${${content_name}_SOURCE_DIR}/src/parser.c)
 
-        if(_libasan_path)
-            set(METACALL_ASAN_DETECTED TRUE)
-            set(METACALL_ASAN_COMPILE_FLAGS -fno-omit-frame-pointer -fno-optimize-sibling-calls -fsanitize=address -fsanitize=undefined -fsanitize-address-use-after-scope -fsanitize=float-divide-by-zero -fsanitize=float-cast-overflow)
-            if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-                list(APPEND METACALL_ASAN_COMPILE_FLAGS -fsanitize=pointer-compare -fsanitize=pointer-subtract -fuse-ld=gold -fsanitize=leak)
-            endif()
-            set(METACALL_ASAN_LINK_FLAGS -fsanitize=address -fsanitize=undefined)
-            if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-                if(_libubsan_path)
-                    set(METACALL_ASAN_PRELOAD_ENV "LD_PRELOAD=${_libasan_path} ${_libubsan_path}")
-                else()
-                    set(METACALL_ASAN_PRELOAD_ENV "LD_PRELOAD=${_libasan_path}")
-                endif()
-            elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
-                set(METACALL_ASAN_PRELOAD_ENV "DYLD_INSERT_LIBRARIES=${_libasan_path}" "DYLD_FORCE_FLAT_NAMESPACE=1")
-            endif()
-            set(METACALL_ASAN_RUNTIME_ENV "ASAN_OPTIONS=use_sigaltstack=0:symbolize=1:alloc_dealloc_mismatch=1:detect_leaks=0:fast_unwind_on_malloc=0" "LSAN_OPTIONS=verbosity=0:log_threads=1:print_suppressions=false")
-        endif()
-    endif()
+	if(EXISTS ${${content_name}_SOURCE_DIR}/src/scanner.c)
+		target_sources(${target_name} PRIVATE ${${content_name}_SOURCE_DIR}/src/scanner.c)
+	endif()
+
+	target_include_directories(${target_name} PUBLIC ${${content_name}_SOURCE_DIR}/src)
+	target_link_libraries(${target_name} PRIVATE ts_runtime)
+	set_target_properties(${target_name} PROPERTIES C_STANDARD 11)
+endmacro()
+
+add_ts_grammar(ts_python tree_sitter_python https://github.com/tree-sitter/tree-sitter-python v0.23.6)
+add_ts_grammar(ts_javascript tree_sitter_javascript https://github.com/tree-sitter/tree-sitter-javascript v0.23.1)
+
+add_executable(ast_inspect src/ast_inspect.cpp)
+target_link_libraries(ast_inspect PRIVATE ts_runtime ts_python ts_javascript)
+target_include_directories(ast_inspect PRIVATE ${tree_sitter_SOURCE_DIR}/lib/include)
+
+if(METACALL_INSPECT_POC_BUILD_AST_TESTS)
+	enable_testing()
+
+	add_test(
+		NAME ast_inspect_python
+		COMMAND ast_inspect ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test.py)
+	set_tests_properties(ast_inspect_python PROPERTIES
+		PASS_REGULAR_EXPRESSION "\"language\":\"python\""
+		FAIL_REGULAR_EXPRESSION "error:")
+
+	add_test(
+		NAME ast_inspect_python_symbol
+		COMMAND ast_inspect ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test.py)
+	set_tests_properties(ast_inspect_python_symbol PROPERTIES
+		PASS_REGULAR_EXPRESSION "python_test_function")
+
+	add_test(
+		NAME ast_inspect_javascript
+		COMMAND ast_inspect ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test.js)
+	set_tests_properties(ast_inspect_javascript PROPERTIES
+		PASS_REGULAR_EXPRESSION "\"language\":\"javascript\""
+		FAIL_REGULAR_EXPRESSION "error:")
+
+	add_test(
+		NAME ast_inspect_javascript_symbol
+		COMMAND ast_inspect ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test.js)
+	set_tests_properties(ast_inspect_javascript_symbol PROPERTIES
+		PASS_REGULAR_EXPRESSION "node_test_function")
 endif()
 
-if(METACALL_ASAN_DETECTED)
-    add_compile_options(${METACALL_ASAN_COMPILE_FLAGS})
-    add_link_options(${METACALL_ASAN_LINK_FLAGS})
+if(METACALL_INSPECT_POC_BUILD_RUNTIME)
+	list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+	find_package(MetaCall REQUIRED)
+
+	if(METACALL_ROOT_DIR)
+		add_compile_definitions(METACALL_BUILD_DIR="${METACALL_ROOT_DIR}")
+	endif()
+
+	function(target_link_metacall target)
+		if(TARGET MetaCall::MetaCall)
+			target_link_libraries(${target} PRIVATE MetaCall::MetaCall)
+		else()
+			target_link_libraries(${target} PRIVATE ${METACALL_LIBRARY})
+			target_include_directories(${target} PRIVATE ${METACALL_INCLUDE_DIRS})
+		endif()
+		target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+	endfunction()
+
+	if(METACALL_ROOT_DIR)
+		set(METACALL_RUNTIME_ENV
+			"LOADER_LIBRARY_PATH=${METACALL_ROOT_DIR}"
+			"SERIAL_LIBRARY_PATH=${METACALL_ROOT_DIR}"
+			"DETOUR_LIBRARY_PATH=${METACALL_ROOT_DIR}"
+			"CONFIGURATION_PATH=${METACALL_ROOT_DIR}/configurations/global.json"
+			"LOADER_SCRIPT_PATH=${CMAKE_CURRENT_SOURCE_DIR}/scripts")
+	else()
+		set(METACALL_RUNTIME_ENV
+			"LOADER_SCRIPT_PATH=${CMAKE_CURRENT_SOURCE_DIR}/scripts")
+	endif()
+
+	add_executable(inspect_poc src/main.cpp)
+	target_link_metacall(inspect_poc)
+
+	if(METACALL_INSPECT_POC_BUILD_RUNTIME_TESTS)
+		FetchContent_Declare(googletest
+			URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+			DOWNLOAD_EXTRACT_TIMESTAMP ON)
+		set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+		FetchContent_MakeAvailable(googletest)
+
+		add_executable(inspect_test tests/test_inspect.cpp)
+		target_link_metacall(inspect_test)
+		target_link_libraries(inspect_test PRIVATE gtest_main)
+
+		include(GoogleTest)
+		gtest_discover_tests(inspect_test PROPERTIES ENVIRONMENT "${METACALL_RUNTIME_ENV}")
+	endif()
+
+	if(METACALL_INSPECT_POC_BUILD_BENCHMARKS)
+		FetchContent_Declare(googlebenchmark
+			URL https://github.com/google/benchmark/archive/refs/tags/v1.8.3.zip
+			DOWNLOAD_EXTRACT_TIMESTAMP ON)
+		set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+		set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+		FetchContent_MakeAvailable(googlebenchmark)
+
+		add_executable(inspect_bench benchmarks/bench_inspect.cpp)
+		target_link_metacall(inspect_bench)
+		target_link_libraries(inspect_bench PRIVATE benchmark::benchmark benchmark::benchmark_main)
+	endif()
 endif()
-
-# ---------------------------------------------------------------------------
-# Linker Helper
-# ---------------------------------------------------------------------------
-function(target_link_metacall target)
-    if(TARGET MetaCall::MetaCall)
-        target_link_libraries(${target} PRIVATE MetaCall::MetaCall)
-    else()
-        target_link_libraries(${target} PRIVATE ${METACALL_LIBRARY})
-        target_include_directories(${target} PRIVATE ${METACALL_INCLUDE_DIRS})
-    endif()
-    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-endfunction()
-
-# ---------------------------------------------------------------------------
-# Environment Helper
-# ---------------------------------------------------------------------------
-if(METACALL_ROOT_DIR)
-    set(METACALL_RUNTIME_ENV
-        "LOADER_LIBRARY_PATH=${METACALL_ROOT_DIR}"
-        "SERIAL_LIBRARY_PATH=${METACALL_ROOT_DIR}"
-        "DETOUR_LIBRARY_PATH=${METACALL_ROOT_DIR}"
-        "CONFIGURATION_PATH=${METACALL_ROOT_DIR}/configurations/global.json"
-        "LOADER_SCRIPT_PATH=${CMAKE_CURRENT_SOURCE_DIR}/scripts"
-        ${METACALL_ASAN_PRELOAD_ENV}
-        ${METACALL_ASAN_RUNTIME_ENV}
-    )
-else()
-    set(METACALL_RUNTIME_ENV
-        "LOADER_SCRIPT_PATH=${CMAKE_CURRENT_SOURCE_DIR}/scripts"
-        ${METACALL_ASAN_PRELOAD_ENV}
-        ${METACALL_ASAN_RUNTIME_ENV}
-    )
-endif()
-
-# ---------------------------------------------------------------------------
-# Main executable: inspect_poc
-# ---------------------------------------------------------------------------
-add_executable(inspect_poc src/main.cpp)
-target_link_metacall(inspect_poc)
-
-# ---------------------------------------------------------------------------
-# Test executable: inspect_test
-# ---------------------------------------------------------------------------
-add_executable(inspect_test tests/test_inspect.cpp)
-target_link_metacall(inspect_test)
-target_link_libraries(inspect_test PRIVATE gtest_main)
-
-include(GoogleTest)
-gtest_discover_tests(inspect_test
-    PROPERTIES ENVIRONMENT "${METACALL_RUNTIME_ENV}"
-)
-
-# ---------------------------------------------------------------------------
-# Benchmark executable: inspect_bench
-# ---------------------------------------------------------------------------
-add_executable(inspect_bench benchmarks/bench_inspect.cpp)
-target_link_metacall(inspect_bench)
-target_link_libraries(inspect_bench PRIVATE
-    benchmark::benchmark
-    benchmark::benchmark_main
-)

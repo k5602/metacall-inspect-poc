@@ -4,19 +4,27 @@ Static symbol extraction PoC for `.py` and `.js` files using Tree-sitter.
 
 ## What it does
 
-`ast_inspect` takes a single file path, parses it statically, and prints minimal JSON:
+`ast_inspect` takes a single file path, parses it statically, and can print:
+
+- `ast` format (default): PoC AST-like output
+- `inspect` format: MetaCall inspect-compatible shape (`<loader_tag> -> [handle -> scope]`)
+
+Extracted data now includes:
 
 - `path`
 - `language` (`python` or `javascript`)
 - `symbols` array with:
   - `name`
-  - `kind` (`function` or `class`)
+  - `kind` (`function`, `class`, `method`, `constructor`)
   - `start_line`
   - `end_line`
+- JS module export detection (`module.exports` / `exports.*` / `export ...`)
+- Class method extraction for Python and JavaScript
 
 Supported CLI flags:
 
 - `--pretty` pretty-prints JSON output.
+- `--format ast|inspect` select output format.
 - `--output-dir <dir>` also writes output JSON file to `<dir>/<input_filename>.json`.
 
 ## Build (static-only)
@@ -41,6 +49,7 @@ After build, from `build-poc`:
 - `./ast_inspect ../scripts/test.js`
 - `./ast_inspect --pretty ../scripts/test.py`
 - `./ast_inspect --pretty --output-dir ../out ../scripts/test.js`
+- `./ast_inspect --format inspect --pretty ../scripts/test.js`
 
 Example output shape:
 
